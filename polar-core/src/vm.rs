@@ -330,7 +330,9 @@ impl PolarVirtualMachine {
             log: polar_log_vars.iter().any(|var| var == &"trace"),
             // `polar_log` for tracing policy evaluation
             polar_log: !polar_log_vars.is_empty()
-                && !polar_log_vars.iter().any(|var| ["0", "off"].contains(var)),
+                && !polar_log_vars
+                    .iter()
+                    .any(|var| ["development", "0", "off"].contains(var)),
             // `polar_log_stderr` prints things immediately to stderr
             polar_log_stderr: polar_log_vars.iter().any(|var| var == &"now"),
             polar_log_mute: false,
@@ -351,7 +353,7 @@ impl PolarVirtualMachine {
                 self.polar_log_stderr = true;
             }
             self.polar_log = match Some(pl).as_deref() {
-                None | Some("0") | Some("off") => false,
+                None | Some("development") | Some("0") | Some("off") => false,
                 _ => true,
             }
         }
