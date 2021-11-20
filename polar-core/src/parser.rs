@@ -219,6 +219,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_trace_rule() {
+        let kb = r#"trace f(x) if x = 1;"#;
+        let line = parse_lines(kb);
+
+        if let Line::Rule(rule) = &line[0] {
+            eprintln!("parsed rule annotation: {:?}", rule.annotation);
+        } else {
+            assert!(false, "failed to parse line");
+        }
+    }
+
+    #[test]
     fn test_rule_type_error() {
         let rule_type = r#"type f(x: String) if x = "bad";"#;
         super::parse_lines(0, rule_type).expect_err("parse error");

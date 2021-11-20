@@ -253,6 +253,7 @@ pub struct PolarVirtualMachine {
     call_id_symbols: HashMap<u64, Symbol>,
 
     /// Logging flag.
+    development_mode: bool,
     log: bool,
     polar_log: bool,
     polar_log_stderr: bool,
@@ -327,6 +328,7 @@ impl PolarVirtualMachine {
             kb,
             call_id_symbols: HashMap::new(),
             // `log` controls internal VM logging
+            development_mode: polar_log_vars.iter().any(|var| var == &"development"),
             log: polar_log_vars.iter().any(|var| var == &"trace"),
             // `polar_log` for tracing policy evaluation
             polar_log: !polar_log_vars.is_empty()
@@ -510,14 +512,21 @@ impl PolarVirtualMachine {
             }
             Goal::TraceRule { trace } => {
                 if let Node::Rule(rule) = &trace.node {
+                    if self.development_mode {
+                        if let Some(_) = rule.annotation {
+                            self.development_log(&format!(
+                                "TRACE RULE: {}",
+                                self.rule_source(rule)
+                            ));
+                        } else {
+                            self.development_log(&format!("RULE: {}", self.rule_source(rule)));
+                        }
+                    }
+
                     self.log_with(
                         || {
                             let source_str = self.rule_source(rule);
-                            if let Some(_) = rule.annotation {
-                                format!("TRACE RULE: {}", source_str)
-                            } else {
-                                format!("RULE: {}", source_str)
-                            }
+                            format!("RULE: {}", source_str)
                         },
                         &[],
                     );
@@ -621,7 +630,17 @@ impl PolarVirtualMachine {
         consequent: Goals,
         mut alternative: Goals,
     ) -> Result<()> {
+        self.development_log(&format!(
+            r#"conditional: {:#?}
+consequent: {:#?}
+alternative: {:#?}"#,
+            conditional.clone(),
+            consequent.clone(),
+            alternative.clone()
+        ));
+
         // If the conditional fails, cut the consequent.
+
         let cut_consequent = Goal::Cut {
             choice_index: self.choices.len(),
         };
@@ -760,6 +779,14 @@ impl PolarVirtualMachine {
             console_error(&message);
         } else {
             self.messages.push(MessageKind::Print, message);
+        }
+    }
+
+    fn development_log(&self, message: &str) {
+        if self.development_mode {
+            for line in message.split('\n') {
+                self.print(format!("[development] {}", line));
+            }
         }
     }
 
@@ -905,6 +932,9 @@ impl PolarVirtualMachine {
             self.print("⇒ backtrack");
         }
         self.log("BACKTRACK", &[]);
+
+        // self.log(&format!("{:#?}", self.trace), &[]);
+        // self.log(&format!("{:#?}", self.trace_stack), &[]);
 
         loop {
             match self.choices.pop() {
