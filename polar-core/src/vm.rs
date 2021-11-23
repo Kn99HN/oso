@@ -6,6 +6,8 @@ use std::rc::Rc;
 use std::string::ToString;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
+use serde_json::to_string as to_json;
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -32,6 +34,7 @@ use crate::runnable::Runnable;
 use crate::sources::*;
 use crate::terms::*;
 use crate::traces::*;
+use crate::traces_v2;
 
 type Result<T> = core::result::Result<T, RuntimeError>;
 
@@ -43,6 +46,9 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 #[allow(clippy::large_enum_variant)]
 pub enum Goal {
     Backtrack,
+    BacktrackFromFailure {
+        reason: String,
+    },
     Cut {
         choice_index: usize, // cuts all choices in range [choice_index..]
     },
@@ -109,6 +115,7 @@ pub enum Goal {
         outer: usize,
         inner: usize,
     },
+    TraceV2Pop(u64),
     TraceRule {
         trace: Rc<Trace>,
     },
@@ -144,6 +151,7 @@ pub struct Choice {
     queries: Queries,      // query stack snapshot
     trace: Vec<Rc<Trace>>, // trace snapshot
     trace_stack: TraceStack,
+    trace_parent_id: Option<u64>,
 }
 
 pub type Choices = Vec<Choice>;
@@ -228,6 +236,9 @@ pub struct PolarVirtualMachine {
     pub trace_stack: TraceStack, // Stack of traces higher up the tree.
     pub trace: Vec<Rc<Trace>>,   // Traces for the current level of the trace tree.
 
+    // trace v2 development mode recording
+    development_trace_recorder: traces_v2::ScopedRecorder,
+
     // Errors from outside the vm.
     pub external_error: Option<String>,
 
@@ -253,7 +264,7 @@ pub struct PolarVirtualMachine {
     call_id_symbols: HashMap<u64, Symbol>,
 
     /// Logging flag.
-    development_mode: bool,
+    development_mode_active: bool,
     log: bool,
     polar_log: bool,
     polar_log_stderr: bool,
@@ -328,7 +339,8 @@ impl PolarVirtualMachine {
             kb,
             call_id_symbols: HashMap::new(),
             // `log` controls internal VM logging
-            development_mode: polar_log_vars.iter().any(|var| var == &"development"),
+            development_mode_active: polar_log_vars.iter().any(|var| var == &"development"),
+            development_trace_recorder: traces_v2::ScopedRecorder::default(),
             log: polar_log_vars.iter().any(|var| var == &"trace"),
             // `polar_log` for tracing policy evaluation
             polar_log: !polar_log_vars.is_empty()
@@ -449,7 +461,16 @@ impl PolarVirtualMachine {
         self.check_timeout()?;
 
         match goal.as_ref() {
-            Goal::Backtrack => self.backtrack()?,
+            Goal::Backtrack => {
+                self.backtrack()?;
+            }
+            Goal::BacktrackFromFailure { reason } => {
+                if self.development_mode_active {
+                    self.development_trace_recorder
+                        .push(traces_v2::Event::backtrack(reason.to_owned()));
+                }
+                self.backtrack()?
+            }
             Goal::Cut { choice_index } => self.cut(*choice_index),
             Goal::Debug { message } => return Ok(self.debug(message)),
             Goal::Halt => return Ok(self.halt()),
@@ -481,6 +502,16 @@ impl PolarVirtualMachine {
             Goal::CheckError => return self.check_error(),
             Goal::Noop => {}
             Goal::Query { term } => {
+                // record a trace for us entering the query
+                let trace_id =
+                    self.development_trace_recorder
+                        .push_parent(traces_v2::Event::execute_goal(
+                            Goal::Query { term: term.clone() },
+                            self.source(term),
+                        ));
+                // push an alternative choice to pop our trace. (executes on backtrack)
+                self.push_choice(vec![vec![Goal::TraceV2Pop(trace_id), Goal::Backtrack]])?;
+
                 let result = self.query(term);
                 self.maybe_break(DebugEvent::Query)?;
                 return result;
@@ -512,15 +543,16 @@ impl PolarVirtualMachine {
             }
             Goal::TraceRule { trace } => {
                 if let Node::Rule(rule) = &trace.node {
-                    if self.development_mode {
-                        if let Some(_) = rule.annotation {
-                            self.development_log(&format!(
-                                "TRACE RULE: {}",
-                                self.rule_source(rule)
-                            ));
-                        } else {
-                            self.development_log(&format!("RULE: {}", self.rule_source(rule)));
-                        }
+                    let source_str = if let Some(_) = &rule.annotation {
+                        format!("TRACE {}", self.rule_source(rule))
+                    } else {
+                        self.rule_source(rule)
+                    };
+                    if self.development_mode_active {
+                        let id = self
+                            .development_trace_recorder
+                            .push_parent(traces_v2::Event::evaluate_rule(source_str.clone(), None));
+                        self.push_choice(vec![vec![Goal::TraceV2Pop(id), Goal::Backtrack]])?;
                     }
 
                     self.log_with(
@@ -543,6 +575,11 @@ impl PolarVirtualMachine {
                     .try_for_each(|(_, constraint)| self.add_constraint(&constraint))?
             }
             Goal::Run { runnable } => return self.run_runnable(runnable.clone_runnable()),
+            Goal::TraceV2Pop(id) => {
+                if self.development_mode_active {
+                    self.development_trace_recorder.pop_to(*id);
+                }
+            }
         }
         Ok(QueryEvent::None)
     }
@@ -594,6 +631,7 @@ impl PolarVirtualMachine {
                 queries: self.queries.clone(),
                 trace: self.trace.clone(),
                 trace_stack: self.trace_stack.clone(),
+                trace_parent_id: None,
             });
             Ok(())
         }
@@ -614,6 +652,16 @@ impl PolarVirtualMachine {
         let mut alternatives_iter = alternatives.into_iter();
         if let Some(alternative) = alternatives_iter.next() {
             self.push_choice(alternatives_iter)?;
+
+            // record trace for choice push
+            if self.development_mode_active {
+                let id = self
+                    .development_trace_recorder
+                    .push_parent(traces_v2::Event::choice_push());
+                self.choices.last_mut().unwrap().trace_parent_id = Some(id);
+                self.development_trace_recorder
+                    .push_parent(traces_v2::Event::execute_choice());
+            }
             self.append_goals(alternative)
         } else {
             self.backtrack()
@@ -630,17 +678,7 @@ impl PolarVirtualMachine {
         consequent: Goals,
         mut alternative: Goals,
     ) -> Result<()> {
-        self.development_log(&format!(
-            r#"conditional: {:#?}
-consequent: {:#?}
-alternative: {:#?}"#,
-            conditional.clone(),
-            consequent.clone(),
-            alternative.clone()
-        ));
-
         // If the conditional fails, cut the consequent.
-
         let cut_consequent = Goal::Cut {
             choice_index: self.choices.len(),
         };
@@ -679,6 +717,10 @@ alternative: {:#?}"#,
             self.print(&format!("⇒ bind: {} ← {}", var.to_polar(), val.to_polar()));
         }
         if let Some(goal) = self.binding_manager.bind(var, val)? {
+            if self.development_mode_active {
+                self.development_trace_recorder
+                    .push(traces_v2::Event::bindings(self.bindings(true)));
+            }
             self.push_goal(goal)
         } else {
             Ok(())
@@ -783,7 +825,7 @@ alternative: {:#?}"#,
     }
 
     fn development_log(&self, message: &str) {
-        if self.development_mode {
+        if self.development_mode_active {
             for line in message.split('\n') {
                 self.print(format!("[development] {}", line));
             }
@@ -933,9 +975,6 @@ impl PolarVirtualMachine {
         }
         self.log("BACKTRACK", &[]);
 
-        // self.log(&format!("{:#?}", self.trace), &[]);
-        // self.log(&format!("{:#?}", self.trace_stack), &[]);
-
         loop {
             match self.choices.pop() {
                 None => return self.push_goal(Goal::Halt),
@@ -946,14 +985,17 @@ impl PolarVirtualMachine {
                     queries,
                     trace,
                     trace_stack,
+                    trace_parent_id,
                 }) => {
                     self.binding_manager.backtrack(&bsp);
+                    let mut last_alternative = false;
                     if let Some(mut alternative) = alternatives.pop() {
                         if alternatives.is_empty() {
                             self.goals = goals;
                             self.queries = queries;
                             self.trace = trace;
                             self.trace_stack = trace_stack;
+                            last_alternative = true;
                         } else {
                             self.goals.clone_from(&goals);
                             self.queries.clone_from(&queries);
@@ -966,7 +1008,30 @@ impl PolarVirtualMachine {
                                 queries,
                                 trace,
                                 trace_stack,
+                                trace_parent_id,
                             })
+                        }
+
+                        if self.development_mode_active {
+                            if let Some(parent_id) = trace_parent_id {
+                                // trace_parent_id being present means that this is *not* the first alternative
+                                //
+                                // pop up to the current parent & continue evaluating alternatives
+                                self.development_trace_recorder.pop_up_to(parent_id);
+                            } else {
+                                // otherwise, this *is* the first alternative and we must record our entry into a new Choice
+                                let trace_id = self
+                                    .development_trace_recorder
+                                    .push_parent(traces_v2::Event::choice_push());
+
+                                // update the trace_parent_id for the newly pushed choice to continue the tracing history
+                                if !last_alternative {
+                                    self.choices.last_mut().unwrap().trace_parent_id =
+                                        Some(trace_id);
+                                }
+                            }
+                            self.development_trace_recorder
+                                .push_parent(traces_v2::Event::execute_choice());
                         }
                         self.goals.append(&mut alternative);
                         break;
@@ -1002,6 +1067,12 @@ impl PolarVirtualMachine {
         self.log("HALT", &[]);
         self.goals.clear();
         self.choices.clear();
+        if self.development_mode_active {
+            self.development_log(&format!(
+                "{:?}",
+                to_json(&self.development_trace_recorder.events()).unwrap()
+            ));
+        }
         QueryEvent::Done { result: true }
     }
 
@@ -1028,7 +1099,9 @@ impl PolarVirtualMachine {
                 let unions_match = (left.is_actor_union() && right.is_actor_union())
                     || (left.is_resource_union() && right.is_resource_union());
                 if !unions_match {
-                    return self.push_goal(Goal::Backtrack);
+                    return self.push_goal(Goal::BacktrackFromFailure {
+                        reason: format!("MATCHES: {:?} is not a subset of {:?}", right, left),
+                    });
                 }
             }
             _ if self.kb.read().unwrap().is_union(right) => self.isa_union(left, right)?,
@@ -1081,7 +1154,9 @@ impl PolarVirtualMachine {
                 let left_fields: HashSet<&Symbol> = left.fields.keys().collect();
                 let right_fields: HashSet<&Symbol> = right.fields.keys().collect();
                 if !right_fields.is_subset(&left_fields) {
-                    return self.push_goal(Goal::Backtrack);
+                    return self.push_goal(Goal::BacktrackFromFailure {
+                        reason: format!("MATCHES: {:?} is not a subset of {:?}", right, left),
+                    });
                 }
 
                 // For each field on the right, isa its value against the corresponding value on
@@ -1327,7 +1402,9 @@ impl PolarVirtualMachine {
                         right: value.clone(),
                     })
                 } else {
-                    self.push_goal(Goal::Backtrack)
+                    self.push_goal(Goal::BacktrackFromFailure {
+                        reason: format!("LOOKUP: Lookup of dictionary field {:?} failed.", field),
+                    })
                 }
             }
             v => Err(self.type_error(
@@ -1508,7 +1585,9 @@ impl PolarVirtualMachine {
             Value::Boolean(value) => {
                 if !value {
                     // Backtrack if the boolean is false.
-                    self.push_goal(Goal::Backtrack)?;
+                    self.push_goal(Goal::BacktrackFromFailure {
+                        reason: "FALSE: query for False term.".to_owned(),
+                    })?;
                 }
 
                 return Ok(QueryEvent::None);
@@ -1951,7 +2030,9 @@ impl PolarVirtualMachine {
             }
             _ => {
                 if !compare(*op, left, right, Some(term))? {
-                    self.push_goal(Goal::Backtrack)?;
+                    self.push_goal(Goal::BacktrackFromFailure {
+                        reason: format!("COMPARISON: {} {:?} {} failed", left, *op, right),
+                    })?;
                 }
                 Ok(QueryEvent::None)
             }
@@ -2255,7 +2336,13 @@ impl PolarVirtualMachine {
                         _ => {
                             // At least one variable is unbound. Bind it.
                             if self.bind(l, right.clone()).is_err() {
-                                self.push_goal(Goal::Backtrack)?;
+                                self.push_goal(Goal::BacktrackFromFailure {
+                                    reason: format!(
+                                        "UNIFY: failed to bind value {} to variable {}",
+                                        right.clone(),
+                                        l
+                                    ),
+                                })?;
                             }
                         }
                     }
@@ -2276,8 +2363,13 @@ impl PolarVirtualMachine {
                         self.push_goal(Goal::Unify { left: value, right })?;
                     }
                     _ => {
-                        if self.bind(var, right).is_err() {
-                            self.push_goal(Goal::Backtrack)?;
+                        if self.bind(var, right.clone()).is_err() {
+                            self.push_goal(Goal::BacktrackFromFailure {
+                                reason: format!(
+                                    "UNIFY: failed to bind value {} to variable {}",
+                                    right, var
+                                ),
+                            })?;
                         }
                     }
                 }
@@ -2291,8 +2383,13 @@ impl PolarVirtualMachine {
                         self.push_goal(Goal::Unify { left, right: value })?;
                     }
                     _ => {
-                        if self.bind(var, left).is_err() {
-                            self.push_goal(Goal::Backtrack)?;
+                        if self.bind(var, left.clone()).is_err() {
+                            self.push_goal(Goal::BacktrackFromFailure {
+                                reason: format!(
+                                    "UNIFY: failed to bind value {} to variable {}",
+                                    left, var
+                                ),
+                            })?;
                         }
                     }
                 }
@@ -2312,7 +2409,9 @@ impl PolarVirtualMachine {
                         },
                     ))?;
                 } else {
-                    self.push_goal(Goal::Backtrack)?
+                    self.push_goal(Goal::BacktrackFromFailure {
+                        reason: format!("UNIFY: {:?} != {:?}", left, right),
+                    })?;
                 }
             }
 
@@ -2327,7 +2426,9 @@ impl PolarVirtualMachine {
                 let left_fields: HashSet<&Symbol> = left.fields.keys().collect();
                 let right_fields: HashSet<&Symbol> = right.fields.keys().collect();
                 if left_fields != right_fields {
-                    self.push_goal(Goal::Backtrack)?;
+                    self.push_goal(Goal::BacktrackFromFailure {
+                        reason: format!("UNIFY: {:?} != {:?}", left_fields, right_fields),
+                    })?;
                     return Ok(());
                 }
 
@@ -2870,6 +2971,10 @@ impl Runnable for PolarVirtualMachine {
 
         if self.goals.is_empty() {
             if self.choices.is_empty() {
+                if self.development_mode_active {
+                    self.development_trace_recorder
+                        .push(traces_v2::Event::done());
+                }
                 return Ok(QueryEvent::Done { result: true });
             } else {
                 self.backtrack()?;
@@ -2885,6 +2990,10 @@ impl Runnable for PolarVirtualMachine {
                 }
             }
             self.maybe_break(DebugEvent::Goal(goal.clone()))?;
+        }
+
+        if self.development_mode_active {
+            self.development_log(&to_json(&self.development_trace_recorder.events()).unwrap());
         }
 
         if self.log {
@@ -2976,6 +3085,11 @@ impl Runnable for PolarVirtualMachine {
                 .filter(|(var, _)| !var.is_temporary_var())
                 .map(|(var, value)| (var.clone(), sub_this(var, value)))
                 .collect();
+        }
+
+        if self.development_mode_active {
+            self.development_trace_recorder
+                .push(traces_v2::Event::result(bindings.clone()));
         }
 
         Ok(QueryEvent::Result { bindings, trace })

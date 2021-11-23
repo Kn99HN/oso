@@ -32,6 +32,7 @@ mod runnable;
 pub mod sources;
 pub mod terms;
 pub mod traces;
+mod traces_v2;
 mod validations;
 mod visitor;
 mod vm;
