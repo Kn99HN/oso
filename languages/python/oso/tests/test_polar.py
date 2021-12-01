@@ -368,6 +368,14 @@ def test_load_and_query():
     with pytest.raises(exceptions.OsoError):
         p.load_str("g(1); ?= g(2);")
 
+def test_load_and_query_suppressing_inline():
+    p_no_inline = Polar()
+    assert p_no_inline.load_str("f(1); f(2); ?= f(2);", inline=False)  == None
+
+    p_inline = Polar()
+    with pytest.raises(exceptions.OsoError):
+        p_inline.load_str("f(1); f(2); ?= f(3);")
+
 
 def test_parser_errors(polar):
     # IntegerOverflow

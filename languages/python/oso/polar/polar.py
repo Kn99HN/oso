@@ -88,18 +88,19 @@ class Polar:
         )
         self.load_files([filename])
 
-    def load_str(self, string: str):
+    def load_str(self, string: str, **kwargs):
         """Load a Polar string, checking that all inline queries succeed."""
         # NOTE: not ideal that the MRO gets updated each time load_str is
         # called, but since we are planning to move to only calling load once
         # with the include feature, I think it's okay for now.
-        self._load_sources([Source(string)])
+        self._load_sources([Source(string)], **kwargs)
 
     # Register MROs, load Polar code, and check inline queries.
-    def _load_sources(self, sources: List[Source]):
+    def _load_sources(self, sources: List[Source], inline=True):
         self.host.register_mros()
         self.ffi_polar.load(sources)
-        self.check_inline_queries()
+        if inline:
+            self.check_inline_queries()
 
     def check_inline_queries(self):
         while True:
