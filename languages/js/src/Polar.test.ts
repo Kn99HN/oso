@@ -704,6 +704,18 @@ describe('errors', () => {
     });
   });
 
+  describe('with suppressing inline queries', () => {
+    test('succeeds if an inline query fails but inline set to false', async () => {
+      const pNoInline = new Polar();
+      await expect(pNoInline.loadStr('g(1); ?= g(2);', undefined, false)).resolves.not.toThrow();
+
+      const pInline = new Polar();
+      await expect(pInline.loadStr('g(1); ?= g(2);')).rejects.toThrow(
+        InlineQueryFailedError
+      );
+    });
+  });
+
   describe('when parsing', () => {
     test('raises on IntegerOverflow errors', async () => {
       const p = new Polar();

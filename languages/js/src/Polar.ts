@@ -157,16 +157,18 @@ export class Polar {
   /**
    * Load a Polar policy string.
    */
-  async loadStr(contents: string, filename?: string): Promise<void> {
-    return this.loadSources([new Source(contents, filename)]);
+  async loadStr(contents: string, filename?: string, inline?: boolean): Promise<void> {
+    return this.loadSources([new Source(contents, filename)], inline);
   }
 
   // Register MROs, load Polar code, and check inline queries.
-  private async loadSources(sources: Source[]): Promise<void> {
+  private async loadSources(sources: Source[], inline: boolean = true): Promise<void> {
     this.getHost().registerMros();
     this.#ffiPolar.load(sources);
     this.processMessages();
-    return this.checkInlineQueries();
+    if(inline) {
+      return this.checkInlineQueries();
+    }
   }
 
   private async checkInlineQueries(): Promise<void> {
